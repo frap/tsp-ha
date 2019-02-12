@@ -21,7 +21,7 @@ atea_app        := $(shell cat atea_app 2>/dev/null || echo 'app-not-configured'
 # ENV variables
 QUIET             = @
 
-SHELL             = bash
+SHELL            := bash
 RM               := rm -f
 MKDIR            := mkdir -p
 AWK              := awk
@@ -33,17 +33,20 @@ TOUCH            := touch
 
 ha_key           := tsp-ha
 SSH_OPTS         := -i ~/.ssh/${ha_key}
-SSH              := ssh
+SSH               = ssh
 username         := atearoot
 user_pri         := ${username}@${PRIMARY_SERVER}
 user_sec         := ${username}@${SECONDARY_SERVER}
-ssh_pri          := ${SSH} ${SSH_OPTS} ${user_pri}
-ssh_sec          := ${SSH} ${SSH_OPTS} ${user_sec}
+ssh_pri          := ${SSH_OPTS} ${user_pri}
+ssh_sec          := ${SSH_OPTS} ${user_sec}
 
-CURL_OPTS        := -o -I -L -s --max-time 5 -w "%{http_code}"
+# -s silent mode -I HEAD request -l follow redirects  -max-time of 5s -o output head to null
+CURL_OPTS        := -s -o /dev/null -I -L --max-time 5 -w "%{http_code}"
 CURL             := curl
 pri-http         := ${CURL_OPTS} http://${PRIMARY_SERVER}
 sec-http         := ${CURL_OPTS} http://${SECONDARY_SERVER}
+hot-sysd         := sudo systemctl status ${TOMCAT_HOT_SYSTEMD} | grep Active | sed -e "s/Active: \(.*\)/\1/"
+cold-sysd        := sudo systemctl status ${TOMCAT_COLD_SYSTEMD} | grep Active | sed -e "s/Active: \(.*\)/\1/"
 pri-tc-hot       := ${pri-http}:${TOMCAT_HOT_PORT}
 sec-tc-hot       := ${sec-http}:${TOMCAT_HOT_PORT}
 pri-tc-cold      := ${pri-http}:${TOMCAT_COLD_PORT}
@@ -52,26 +55,135 @@ sec-tc-cold      := ${sec-http}:${TOMCAT_COLD_PORT}
 START_TIME       := $(shell date)
 CURRENT_TIME      = $(shell date)
 
+# Fixed environment variables
+#
+#
+hostname       := $(shell hostname -s)
+rsync_opts     := -avPz -e "ssh -i ~/.ssh/id_rsa" --delete-after --exclude="node_modules" --exclude=".git"
+tspha_config    := ssh://git/~/repos/devops/make/tsp-ha.git
+data_dir        := status
+
+# $(call check-web-status, server-url)
+check-web-status = $(if $(filter 200,$(shell ${CURL} $1)),active,DOWN)
+# $(call check-sysd-status, ssh-host, tomcat-service )
+check-sysd-status = $(if $(findstring run,$(shell ${SSH} $1 $2)),active,DOWN)
+
+
+hot-pri-status       = $(shell ${SSH} ${ssh_pri} ${hot-sysd})
+hot-sec-status       = $(shell ${SSH} ${ssh_sec} ${hot-sysd})
+stop-pri-cold        = $(shell ${SSH} ${ssh_pri} sudo systemctl stop ${TOMCAT_COLD_SYSTEMD})
+start-sec-cold       = $(shell ${SSH} ${ssh_sec} sudo systemctl start ${TOMCAT_COLD_SYSTEMD})
+cold-pri-status      = $(shell ${SSH} ${ssh_pri} ${cold-sysd})
+cold-sec-status      = $(shell ${SSH} ${ssh_sec} ${cold-sysd})
+web-pri-status       = $(if $(filter 200,$(shell ${CURL} ${pri-http})),active,DOWN)
+web-sec-status       = $(if $(filter 200,$(shell ${CURL} ${sec-http})),active,DOWN)
+web-pri-hot-status   = $(if $(filter 200,$(shell ${CURL} ${pri-tc-hot})),active,DOWN)
+web-sec-hot-status   = $(if $(filter 200,$(shell ${CURL} ${sec-tc-hot})),active,DOWN)
+web-pri-cold-status  = $(if $(filter 200,$(shell ${CURL} ${pri-tc-cold})),active,standby)
+web-sec-cold-status  = $(if $(filter 200,$(shell ${CURL} ${sec-tc-cold})),active,standby)
+sysd-pri-cold-status = $(if $(findstring run,${cold-pri-status}),active,DOWN)
+sysd-sec-cold-status = $(if $(findstring run,${cold-sec-status}),active,DOWN)
+active-cold-server   = $(if $(filter active,${sysd-pri-cold-status}),${PRIMARY_SERVER},${SECONDARY_SERVER})
+
+.PHONY : help
+help : Makefile
+	@sed -n 's/^##//p'  $<
+
+## setup                      : Setup ssh keys bettwen pri and sec servers
+setup : | ${HOME}/.ssh/${ha_key} ; ${call assert-command-present,curl}
+	@echo Setting up pri and sec server ssh keys
+
+${HOME}/.ssh/${ha_key}: ; ${call assert-command-present,ssh}
+	@echo "Setting up ssh keys between pri=${PRIMARY_SERVER} and sec=${SECONDARY_SERVER}"
+	ssh-keygen -b 2048 -C "${hostname} Atea TSP HA key" -t rsa -f $@
+	ssh-copy-id -i ~/.ssh/${ha_key} ${user_pri}
+	ssh-copy-id -i ~/.ssh/${ha_key} ${user_sec}
+
+## bhp-srv-status             : Check BHP server status for A/A and A/S apps
+bhp-srv-status : web-status
+	@echo "#####################################################################"
+	${QUIET} echo "BHP Current Active/Standby Server is   =         ${active-cold-server}"
+
+## make-pri-active            : Make the pri server Active and put primary in DOWN state
+make-pri-active: sysd-cold-status
+	@echo "#### Making BHP Primary Server the Active Server ####################"
+  ifeq "${sysd-sec-cold-status}" "DOWN"
+	@echo "!!!! BHP Primary should be active as Secondary is currently DOWN: !!!"
+	${start-pri-cold}
+  else
+	${stop-sec-cold}
+	${start-pri-cold}
+  endif
+
+## make-sec-active            : Make the sec server Active and put primary in DOWN state
+make-sec-active:
+	@echo "#### Making BHP Standby Server the Active Server ####################"
+  ifeq "${sysd-pri-cold-status}" "DOWN"
+	@echo "!!!! BHP Secondary should be active as Primary is currently DOWN: !!!"
+	${start-sec-cold}
+  else
+	${stop-pri-cold}
+	${start-sec-cold}
+  endif
+
+## web-status                : What is the web status of BHP servers?
+web-status :
+	@echo "#####################################################################"
+	${QUIET} echo "BHP Active  Server:${PRIMARY_SERVER} Status =         ${web-pri-status}"
+	${QUIET} echo "BHP Standby Server:${SECONDARY_SERVER} Status =         ${web-sec-status}"
+
+## web-hot-status            : What is the web status of 'hot' tomcat ?
+web-hot-status :
+	@echo "#####################################################################"
+	${QUIET} echo "BHP Pri Server Hot  Tomcat Status  =         ${web_pri_hot_status}"
+	${QUIET} echo "BHP Sec Server Hot  Tomcat Status  =         ${web_sec_hot_status}"
+
+## sysd-cold-status          : What is systemctl status of 'cold' tomcat ?
+sysd-cold-status :
+	@echo "#####################################################################"
+	${QUIET} echo "BHP Primary   Server Cold Tomcat Status  =         ${sysd-pri-cold-status}"
+	${QUIET} echo "BHP Secondary Server Cold Tomcat Status  =         ${sysd-sec-cold-status}"
+
+## sysd-hot-status           : What is systemctl status of 'hot' tomcat ?
+sysd-hot-status :
+	@echo "#####################################################################"
+	${QUIET} echo "BHP Primary   Server Hot Tomcat Status   =         ${sysd-pri-hot-status}"
+	${QUIET} echo "BHP Secondary Server Hot Tomcat Status   =         ${sysd-sec-hot-status}"
+
+## jctl-cold-status          : What is journalctl status of 'cold' tomcat?
+jctl-cold-status : | ${HOME}/.ssh/${ha_key}
+	@echo "#####################################################################"
+	@echo "#### BHP Pri Server Cold Tomcat Latest Logs:                     ####"
+	${QUIET} ${SSH} ${ssh_pri} "sudo journalctl -u tomcat -o cat -n 10"
+	@echo "#### BHP Sec Server Cold Tomcat Latest Logs:                     ####"
+	${QUIET} ${SSH} ${ssh_sec} "sudo journalctl -u tomcat -o cat -n 10"
+
+## FORCE-pri-active            : Force the pri server Active and put secondary in DOWN state
+FORCE-pri-active: sysd-cold-status
+	@echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	@echo "!!! FORCING BHP Primary Server active                            !!!!"
+	${QUIET} ${SSH} ${ssh_pri} sudo systemctl restart ${TOMCAT_COLD_SYSTEMD}
+
+## FORCE-sec-active            : Force the sec server Active and put primary in DOWN state
+FORCE-sec-active: sysd-cold-status
+	@echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	@echo "!!! FORCING BHP Secondary Server active                          !!!!"
+	${QUIET} ${SSH} ${ssh_sec}  sudo systemctl restart ${TOMCAT_COLD_SYSTEMD}
+#
+# some makefile debug parameters
+#
+
+#OLD_SHELL := $(SHELL)
+#SHELL = $(warning bash Running $@$(if $<, (from $<))$(if $?, ($? newer)))$(OLD_SHELL) -x
+
 env_file = /tmp/env
 env_shell = $(shell rm -f $(env_file))$(foreach V,$1,$(shell echo export$V=$($V) >> $(env_file)))$(shell echo '$2' >> $(env_file))$(shell /bin/bash -e $(env_file))
-#assert-command-present = $(if $(shell which $1),,$(error '$1' missing and needed for this build))
+
+assert-command-present = $(if $(shell which $1),,$(error '$1' missing and needed for this build))
+
 make-truth = $(if $1,T)
 
-ifdef TRACE
-.PHONY: _trace _value
-_trace: ; @$(MAKE) --no-print-directory TRACE= \
-      $(TRACE)='$$(warning TRACE $(TRACE))$(shell $(MAKE) TRACE=$(TRACE) _value)'
-_value: ; @echo '$(value $(TRACE))'
-endif
-
-# $(call assert,condition,message)
-#define assert
-#$(if ,,$(error Assertion failed: ))
-#endef
-# $(call assert-not-null,make-variable)
-#define assert-not-null
-#$(call assert,$(),The variable "" is null)
-#endef
+check-sysd-status = $(if )
 # $(call file-exists, file-name)
 #   Return non-null if a file exists.
 file-exists = $(wildcard $1)
@@ -82,28 +194,6 @@ file-exists = $(wildcard $1)
 maybe-mkdir = $(if $(call file-exists,          \
                      $(if $1,$1,$(dir $@))),,   \
                 $(MKDIR) $(if $1,$1,$(dir $@)))
-#
-# Fixed environment variables
-#
-#
-hostname       := $(shell hostname -s)
-rsync_opts     := -avPz -e "ssh -i ~/.ssh/id_rsa" --delete-after --exclude="node_modules" --exclude=".git"
-tspha_config    := ssh://git/~/repos/devops/make/tsp-ha.git
-data_dir        := status
-
-pri-status       = $(if $(filter 200,$(shell ${CURL} ${pri-http})),active,DOWN)
-sec-status       = $(if $(filter 200,$(shell ${CURL} ${sec-http})),active,DOWN)
-#pri_status      = $(shell if [ $$(${curl_pri}) -eq 200 ]; then echo "up"; else echo "DOWN"; fi)
-#sec_status      = $(shell if [ $$(${curl_sec}) -eq 200 ]; then echo "up"; else echo "DOWN"; fi)
-pri_tomcat_hot  = $(shell if [ $$(${curl_pri_hot}) -eq 200 ]; then echo "active"; else echo "DOWN"; fi)
-sec_tomcat_hot  = $(shell if [ $$(${curl_sec_hot}) -eq 200 ]; then echo "active"; else echo "DOWN"; fi)
-pri_tomcat_cold = $(shell if [ $$(${curl_pri_cold}) -eq 200 ]; then echo "active"; else echo "standby"; fi)
-sec_tomcat_cold = $(shell if [ $$(${curl_sec_cold}) -eq 200 ]; then echo "active"; else echo "standby"; fi)
-
-
-.PHONY : help
-help : Makefile
-	@sed -n 's/^##//p'  $<
 
 print-%: ; @echo $* = '$($*)' from $(origin $*)
 
@@ -112,62 +202,5 @@ printvars:
 	@$(foreach V,$(sort $(.VARIABLES)),            \
   $(if $(filter-out environment% default automatic,  \
   $(origin $V)),$(info $V=$($V) ($(value $V)))))
-
-## setup                      : Setup Atea TSP HA
-setup : | ${HOME}/.ssh/${ha_key} ; ${call assert-command-present,curl}
-	@echo Setting up
-
-${HOME}/.ssh/${ha_key}: ; ${call assert-command-present,ssh}
-	@echo "Setting up ssh keys between pri=${PRIMARY_SERVER} and sec=${SECONDARY_SERVER}"
-	ssh-keygen -b 2048 -C "${hostname} Atea TSP HA key" -t rsa -f $@
-	ssh-copy-id -i ~/.ssh/${ha_key} ${user_pri}
-	ssh-copy-id -i ~/.ssh/${ha_key} ${user_sec}
-
-## bhp-srv-status              : Check BHP server status via web requests
-bhp-srv-status : web-sec-status
-
-## web-pri-status             : What is status of primary?
-web-pri-status :
-#	${pri_status}
-	${QUIET} echo "Pri Server:${PRIMARY_SERVER} Status =         ${pri-status}"
-
-## web-sec-status             : What is status of secondary?
-web-sec-status :
-	${QUIET} echo "Sec Server:${SECONDARY_SERVER} Status =         ${sec-status}"
-
-## web-hot-status             : What is status of 'hot' tomcat ?
-web-hot-status : web-sec-status
-	${QUIET} echo "Pri Server Hot  Tomcat Status  =         ${pri_tomcat_hot}"
-	${QUIET} echo "Sec Server Hot  Tomcat Status  =         ${sec_tomcat_hot}"
-
-## web-cold-status            : What is status of 'cold' tomcat ?
-web-cold-status : web-hot-status
-	${QUIET} echo "Pri Server Cold Tomcat Status  =         ${pri_tomcat_cold}"
-	${QUIET} echo "Sec Server Cold Tomcat Status  =         ${sec_tomcat_cold}"
-
-## jctl-cold-status           : What is journalctl status of 'cold' tomcat?
-jctl-cold-status : | ${HOME}/.ssh/${ha_key}
-	@echo "Pri Server Cold Tomcat Latest Logs:"
-	${QUIET} ${ssh_pri} "sudo journalctl -u tomcat -o cat -n 10"
-	@echo "Sec Server Cold Tomcat Latest Logs:"
-	${QUIET} ${ssh_sec} "sudo journalctl -u tomcat -o cat -n 10"
-
-## sysd-cold-status           : What is systemd status of 'cold' tomcat?
-sysd-cold-status : ${HOME}/.ssh/${ha_key}
-	@echo "Pri Server Cold Tomcat Systemd Status:"
-	${QUIET} ${ssh_pri} "sudo systemctl status ${TOMCAT_COLD_SYSTEMD} | grep Active"
-	@echo "Sec Server Cold Tomcat Systemd Status:"
-	${QUIET} ${ssh_sec} "sudo systemctl status ${TOMCAT_COLD_SYSTEMD} | grep Active"
-
-## sysd-hot-status            : What is systemd status of 'hot' tomcat?
-sysd-hot-status :
-	@echo "Pri Server Hot Tomcat Systemd Status:"
-	${QUIET} ${ssh_pri} "sudo systemctl status ${TOMCAT_HOT_SYSTEMD} | grep Active"
-	@echo "Sec Server Hot Tomcat Systemd Status:"
-	${QUIET} ${ssh_sec} "sudo systemctl status ${TOMCAT_HOT_SYSTEMD} | grep Active"
-
-.PHONY: rsync
-rsync:
-	command -v $@ > /dev/null || yum install $@
 
 #  Makefile ends here
