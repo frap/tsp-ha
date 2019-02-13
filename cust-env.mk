@@ -1,6 +1,6 @@
-#  env.mk ---
+#  cust-env.mk ---
 #
-#  Author: Andrés Gasson <agasson@red-elvis.net>
+#  Author: Andrés Gasson <agasson@ateasystems.com>
 #  Copyright © 2019, Andrés Gasson, all rights reserved.
 #  Created:  5 February 2019
 #
@@ -12,10 +12,13 @@
 # $(<D)    the directory part of the first prerequisite (i.e., dependency)
 # $(<F)    the file part of the first prerequisite (i.e., dependency)
 
-PRIMARY_SERVER      = 10.66.99.100
-SECONDARY_SERVER    = 10.66.99.110
-TOMCAT_HOT_SYSTEMD  = vms-cdr-sync
-TOMCAT_COLD_SYSTEMD = tomcat
-TOMCAT_HOT_PORT     = 8077
-TOMCAT_COLD_PORT    = 8088
-#  env.mk ends here
+CUST-NAME               := "BHP"
+PRIMARY-SERVER-IP       := "10.66.99.100"
+SECONDARY-SERVER-IP     := 10.66.99.110
+HOT-SERVICE-SYSD-NAME   := "mtail"
+COLD-SERVICE-SYSD-NAME  := "tomcat"
+HOT-SERVICE-PORT        := 8077
+COLD-SERVICE-PORT       := 8088
+
+
+#  cust-env.mk ends here
